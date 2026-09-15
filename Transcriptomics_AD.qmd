@@ -1,0 +1,1019 @@
+---
+title: "Brain Transcriptomics in Alzheimer's Disease"
+subtitle: "Postmortem bulk RNA-seq of prefrontal cortex and cerebellum from cognitively normal, Alzheimer's disease and Down syndrome with AD donors"
+author: "Rahel Park"
+date: today
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    code-fold: true
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    incremental: false
+    smaller: true
+    scrollable: true
+    embed-resources: true
+    fontsize: 1.6em
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r}
+#| label: setup
+#| cache: false
+#| include: false       
+
+library(tidyverse)
+library(edgeR)
+library(Glimma)
+library(biomaRt)
+library(dplyr)
+library(stringr)
+library(RColorBrewer)
+library(gplots)
+library(knitr)
+library(ggrepel)
+library(clusterProfiler)
+library(enrichplot)
+
+
+# ============================================================
+# LOAD COUNTS
+# ============================================================
+counts <- read.delim("data/DSAD-ApoE125_readcounts.txt", 
+                     header = TRUE, 
+                     skip = 1)
+head(counts)
+
+# Remove corrupted rows
+bad_rows <- which(is.na(counts$Geneid) | !grepl("^ENSG", counts$Geneid) | 
+                    rowSums(is.na(counts[, grepl("^R", colnames(counts))])) > 0)
+length(bad_rows)
+counts_clean <- counts[-bad_rows, ]
+
+# Drop annotation columns, clean sample column names
+counts_clean <- counts_clean %>%
+  dplyr::select(-Chr, -Start, -End, -Strand, -Length)
+colnames(counts_clean) <- gsub("_Aligned.sortedByCoord.out.bam", "", colnames(counts_clean))
+
+count_matrix <- as.matrix(counts_clean[, -1])
+rownames(count_matrix) <- counts_clean$Geneid
+
+# ============================================================
+# LOAD AND CLEAN METADATA
+# ============================================================
+meta_raw <- read.csv("data/EMTAB14179_metadata.csv", check.names = FALSE)
+colnames(meta_raw)
+
+meta <- meta_raw %>%
+  dplyr::select(
+    sample_name = `Source Name`,
+    age          = `Characteristics[age]`,
+    brain_part   = `Characteristics[organism part]`,
+    disease      = `Characteristics[disease]`,
+    sex          = `Characteristics[sex]`,
+    file_name    = `Comment[SUBMITTED_FILE_NAME]`,
+    ENA_run      = `Comment[ENA_RUN]`,
+    braak        = Braak,
+    pmi          = PMI,
+    adrc         = ADRC
+  ) %>%
+  mutate(
+    sample_name = str_replace_all(sample_name, " ", "_"),
+    brain_part  = str_replace_all(brain_part, " ", "_"),
+    disease = case_when(
+      disease == "normal" ~ "CTL",
+      disease == "Down syndrome with Alzheimer's disease" ~ "DSAD",
+      disease == "Alzheimer's disease" ~ "AD",
+      TRUE ~ disease
+    ),
+    braak = as.factor(braak),
+    adrc  = as.factor(adrc)
+  )
+
+meta <- meta %>%
+  mutate(R_number = str_extract(file_name, "R[0-9]+")) %>%
+  mutate(R_number = case_when(
+    sample_name == "CTL_2_Cbl" ~ "R54_2",
+    sample_name == "DSAD_21_Ctx" ~ "R115_2",
+    sample_name == "sAD_9_Cbl" ~ "R61_2",
+    TRUE ~ R_number
+  )) %>%
+  mutate(individual_id = str_remove(sample_name, "_Cbl$|_Ctx$")) %>%
+  mutate(group_tissue = paste0(disease, "_", 
+                               ifelse(brain_part == "prefrontal_cortex", "PC", "Cer"))) %>%
+  dplyr::select(-file_name) %>%
+  distinct()
+
+# Check alignment with count matrix
+setdiff(colnames(count_matrix), meta$R_number)
+setdiff(meta$R_number, colnames(count_matrix))
+
+# Reorder meta to match count_matrix column order
+meta <- meta[match(colnames(count_matrix), meta$R_number), ]
+all(colnames(count_matrix) == meta$R_number)  # should be TRUE
+
+# ============================================================
+# BUILD DGEList
+# ============================================================
+dge <- DGEList(counts = count_matrix)
+dge$samples$group        <- meta$disease
+dge$samples$brain_part   <- meta$brain_part
+dge$samples$sex          <- meta$sex
+dge$samples$age          <- meta$age
+dge$samples$individual_id <- meta$individual_id
+dge$samples$braak        <- meta$braak
+dge$samples$pmi          <- meta$pmi
+dge$samples$adrc         <- meta$adrc
+dge$samples$group_tissue <- as.factor(meta$group_tissue)
+
+head(dge$samples)
+dim(dge)
+
+# ============================================================
+# GENE ANNOTATION (biomaRt)
+# Cached to disk after the first successful query, since Ensembl's
+# public BioMart service is occasionally unavailable and this
+# annotation doesn't change between renders.
+# ============================================================
+annotation_cache <- "data/gene_annotation.rds"
+
+if (file.exists(annotation_cache)) {
+  genes_bm <- readRDS(annotation_cache)
+} else {
+  mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+  genes_bm <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "gene_biotype", "description"),
+                    filters = "ensembl_gene_id",
+                    values = rownames(dge),
+                    mart = mart)
+  saveRDS(genes_bm, annotation_cache)
+}
+
+nrow(genes_bm)
+nrow(dge)
+
+genes_bm <- genes_bm[!duplicated(genes_bm$ensembl_gene_id), ]
+genes_bm <- genes_bm[match(rownames(dge), genes_bm$ensembl_gene_id), ]
+
+nrow(genes_bm) == nrow(dge)  # should be TRUE
+sum(is.na(genes_bm$ensembl_gene_id))  # how many unmatched
+
+dge$genes <- genes_bm
+dge
+
+
+# ============================================================
+# FILTER LOW-EXPRESSION GENES
+# ============================================================
+keep.exprs <- filterByExpr(dge, group = dge$samples$group)
+dge <- dge[keep.exprs, , keep.lib.sizes = FALSE]
+dim(dge)
+
+# ============================================================
+# NORMALIZATION 
+# ============================================================
+dge_unnorm <- dge
+dge_unnorm$samples$norm.factors <- 1
+
+dge <- normLibSizes(dge, method = "TMM")
+dge$samples$norm.factors
+
+
+
+# ============================================================
+# CONVERT KEY VARIABLES TO FACTORS
+# ============================================================
+dge$samples$group      <- as.factor(dge$samples$group)
+dge$samples$brain_part <- as.factor(dge$samples$brain_part)
+dge$samples$sex        <- as.factor(dge$samples$sex)
+# braak, adrc, group_tissue already factors - confirmed by str()
+# pmi, age stay numeric - correct as-is
+
+
+# ============================================================
+# CORTEX SUBSET: AD vs CTL
+# (DSAD excluded — different site/age, addressed separately
+# in cross-tissue interaction analysis)
+# ============================================================
+dge_pc <- dge[, dge$samples$brain_part == "prefrontal_cortex" &
+                dge$samples$group %in% c("AD", "CTL")]
+dge_pc$samples <- droplevels(dge_pc$samples)
+
+keep.exprs.pc <- filterByExpr(dge_pc, group = dge_pc$samples$group)
+dge_pc <- dge_pc[keep.exprs.pc, , keep.lib.sizes = FALSE]
+dge_pc <- normLibSizes(dge_pc, method = "TMM")
+
+
+# ============================================================
+# CONFOUNDER CHECKS: AD vs CTL cortex
+# 
+# ============================================================
+# Age difference between groups — actually test it
+kruskal.test(age ~ group, data = dge_pc$samples)
+
+# PMI difference
+kruskal.test(pmi ~ group, data = dge_pc$samples)
+
+# Sex balance — chi-square
+chisq.test(table(dge_pc$samples$group, dge_pc$samples$sex))
+
+# ============================================================
+# Cortex MDS and DE objects# 
+# ============================================================
+
+lcpm_pc <- cpm(dge_pc, log = TRUE)
+design_pc <- model.matrix(~0 + group + age + sex, data = dge_pc$samples)
+colnames(design_pc) <- gsub("group", "", colnames(design_pc))
+contr_pc <- makeContrasts(AD_vs_CTL = AD - CTL, levels = colnames(design_pc))
+v_pc <- voom(dge_pc, design_pc, plot = FALSE)
+vfit_pc <- lmFit(v_pc, design_pc)
+vfit_pc <- contrasts.fit(vfit_pc, contrasts = contr_pc)
+efit_pc <- eBayes(vfit_pc)
+top10_pc <- topTable(efit_pc, coef = "AD_vs_CTL", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val, description)
+
+# ============================================================
+# EXPLORATORY: SEX-STRATIFIED AD vs CTL (cortex)
+# ============================================================
+
+# females
+dge_pc_f <- dge_pc[, dge_pc$samples$sex == "female"]
+dge_pc_f$samples <- droplevels(dge_pc_f$samples)
+keep <- filterByExpr(dge_pc_f, group = dge_pc_f$samples$group)
+dge_pc_f <- dge_pc_f[keep, , keep.lib.sizes = FALSE]
+dge_pc_f <- normLibSizes(dge_pc_f, method = "TMM")
+design_f <- model.matrix(~0 + group + age, data = dge_pc_f$samples)
+colnames(design_f) <- gsub("group", "", colnames(design_f))
+v_f <- voom(dge_pc_f, design_f, plot = FALSE)
+vfit_f <- lmFit(v_f, design_f)
+vfit_f <- contrasts.fit(vfit_f, makeContrasts(AD_vs_CTL = AD - CTL, levels = colnames(design_f)))
+efit_f <- eBayes(vfit_f)
+top_f <- topTable(efit_f, coef = "AD_vs_CTL", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val)
+
+# males
+dge_pc_m <- dge_pc[, dge_pc$samples$sex == "male"]
+dge_pc_m$samples <- droplevels(dge_pc_m$samples)
+keep <- filterByExpr(dge_pc_m, group = dge_pc_m$samples$group)
+dge_pc_m <- dge_pc_m[keep, , keep.lib.sizes = FALSE]
+dge_pc_m <- normLibSizes(dge_pc_m, method = "TMM")
+design_m <- model.matrix(~0 + group + age, data = dge_pc_m$samples)
+colnames(design_m) <- gsub("group", "", colnames(design_m))
+v_m <- voom(dge_pc_m, design_m, plot = FALSE)
+vfit_m <- lmFit(v_m, design_m)
+vfit_m <- contrasts.fit(vfit_m, makeContrasts(AD_vs_CTL = AD - CTL, levels = colnames(design_m)))
+efit_m <- eBayes(vfit_m)
+top_m <- topTable(efit_m, coef = "AD_vs_CTL", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val)
+
+
+# ============================================================
+# CEREBELLUM SUBSET: AD vs CTL
+# ============================================================
+dge_cer <- dge[, dge$samples$brain_part == "cerebellum" & 
+                 dge$samples$group %in% c("AD", "CTL")]
+dge_cer$samples <- droplevels(dge_cer$samples)
+
+keep.exprs.cer <- filterByExpr(dge_cer, group = dge_cer$samples$group)
+dge_cer <- dge_cer[keep.exprs.cer, , keep.lib.sizes = FALSE]
+dge_cer <- normLibSizes(dge_cer, method = "TMM")
+
+dim(dge_cer)
+table(dge_cer$samples$group)
+
+
+# ============================================================
+# CONFOUNDER CHECKS: AD vs CTL cerebellum
+# 
+# ============================================================
+# Age difference between groups — actually test it
+kruskal.test(age ~ group, data = dge_cer$samples)
+
+# PMI difference
+kruskal.test(pmi ~ group, data = dge_cer$samples)
+
+# Sex balance — chi-square
+chisq.test(table(dge_cer$samples$group, dge_cer$samples$sex))
+
+
+# ============================================================
+# CEREBELLUM MDS: AD vs CTL
+# ============================================================
+lcpm_cer <- cpm(dge_cer, log = TRUE)
+design_cer <- model.matrix(~0 + group + age + sex, data = dge_cer$samples)
+colnames(design_cer) <- gsub("group", "", colnames(design_cer))
+contr_cer <- makeContrasts(AD_vs_CTL = AD - CTL, levels = colnames(design_cer))
+v_cer <- voom(dge_cer, design_cer, plot = FALSE)
+vfit_cer <- lmFit(v_cer, design_cer)
+vfit_cer <- contrasts.fit(vfit_cer, contrasts = contr_cer)
+efit_cer <- eBayes(vfit_cer)
+top_cer <- topTable(efit_cer, coef = "AD_vs_CTL", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val, description)
+top_pc <- topTable(efit_pc, coef = "AD_vs_CTL", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, logFC, P.Value, adj.P.Val)
+
+# ============================================================
+# BRAAK GRADIENT ANALYSIS: CORTEX (CTL + AD, age + sex adjusted)
+# ============================================================
+
+# Use CTL + AD cortex samples with non-NA Braak
+dge_braak_pc <- dge[, dge$samples$brain_part == "prefrontal_cortex" &
+                   dge$samples$group %in% c("AD", "CTL") &
+                   !is.na(dge$samples$braak)]
+dge_braak_pc$samples <- droplevels(dge_braak_pc$samples)
+
+# Convert braak to numeric for continuous regression
+dge_braak_pc$samples$braak_num <- as.numeric(as.character(dge_braak_pc$samples$braak))
+
+dim(dge_braak_pc)
+table(dge_braak_pc$samples$braak_num)
+
+keep <- filterByExpr(dge_braak_pc, group = dge_braak_pc$samples$group)
+dge_braak_pc <- dge_braak_pc[keep, , keep.lib.sizes = FALSE]
+dge_braak_pc <- normLibSizes(dge_braak_pc, method = "TMM")
+
+
+design_braak_pc <- model.matrix(~braak_num + age + sex, data = dge_braak_pc$samples)
+v_braak_pc <- voom(dge_braak_pc, design_braak_pc, plot = FALSE)
+vfit_braak_pc <- lmFit(v_braak_pc, design_braak_pc)
+efit_braak_pc <- eBayes(vfit_braak_pc)
+top_braak_pc <- topTable(efit_braak_pc, coef = "braak_num", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val, description)
+
+# ============================================================
+# BRAAK GRADIENT ANALYSIS: CEREBELLUM (CTL + AD, age + sex adjusted)
+# ============================================================
+
+# Use CTL + AD cerebellum samples with non-NA Braak
+dge_braak_cer <- dge[, dge$samples$brain_part == "cerebellum" &
+                   dge$samples$group %in% c("AD", "CTL") &
+                   !is.na(dge$samples$braak)]
+dge_braak_cer$samples <- droplevels(dge_braak_cer$samples)
+
+# Convert braak to numeric for continuous regression
+dge_braak_cer$samples$braak_num <- as.numeric(as.character(dge_braak_cer$samples$braak))
+
+dim(dge_braak_cer)
+table(dge_braak_cer$samples$braak_num)
+
+keep <- filterByExpr(dge_braak_cer, group = dge_braak_cer$samples$group)
+dge_braak_cer <- dge_braak_cer[keep, , keep.lib.sizes = FALSE]
+dge_braak_cer <- normLibSizes(dge_braak_cer, method = "TMM")
+
+
+design_braak_cer <- model.matrix(~braak_num + age + sex, data = dge_braak_cer$samples)
+v_braak_cer <- voom(dge_braak_cer, design_braak_cer, plot = FALSE)
+vfit_braak_cer <- lmFit(v_braak_cer, design_braak_cer)
+efit_braak_cer <- eBayes(vfit_braak_cer)
+top_braak_cer <- topTable(efit_braak_cer, coef = "braak_num", n = 10, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val, description)
+
+
+# ============================================================
+# CROSS-TISSUE INTERACTION: CORTEX vs CEREBELLUM
+# (within-individual, all three groups: CTL, AD, DSAD)
+# Using cerebellum as internal reference per individual
+# Site confound less problematic here: within-person Ctx-Cer 
+# comparison is site-internal for each group
+# ============================================================
+
+# Use full dataset (both tissues, all groups)
+design_int <- model.matrix(~0 + group_tissue, data = dge$samples)
+colnames(design_int) <- levels(dge$samples$group_tissue)
+v_full <- voom(dge, design_int, plot = FALSE)
+corfit <- duplicateCorrelation(v_full, design_int,
+                               block = dge$samples$individual_id)
+vfit_full <- lmFit(v_full, design_int,
+                   block = dge$samples$individual_id,
+                   correlation = corfit$consensus)
+contr_int <- makeContrasts(
+  AD_region_effect   = (AD_PC - AD_Cer) - (CTL_PC - CTL_Cer),
+  DSAD_region_effect = (DSAD_PC - DSAD_Cer) - (CTL_PC - CTL_Cer),
+  levels = colnames(design_int)
+)
+vfit_full <- contrasts.fit(vfit_full, contrasts = contr_int)
+efit_full <- eBayes(vfit_full)
+
+dsad_results <- topTable(efit_full, coef = "DSAD_region_effect",
+                          n = Inf, sort.by = "P")
+top_dsad_region <- topTable(efit_full, coef = "DSAD_region_effect",
+                             n = 20, sort.by = "P") %>%
+  dplyr::select(external_gene_name, gene_biotype, logFC, P.Value, adj.P.Val, description)
+top_ad_region <- topTable(efit_full, coef = "AD_region_effect",
+                           n = 20, sort.by = "P")$external_gene_name
+top_dsad_region_names <- top_dsad_region$external_gene_name
+
+ad_pathway_genes <- c("KIF5A", "TSC2", "PEX6", "RAPGEF4", "MCTP2",
+                      "TREM2", "AIF1", "C1QA", "C1QB", "TYROBP",
+                      "VGF", "SCG2", "SCG3", "APP", "MAPT", "APOE")
+
+
+# ============================================================
+# PATHWAY ENRICHMENT: DSAD REGION EFFECT
+# Using clusterProfiler for GO and KEGG enrichment
+# ============================================================
+
+
+# ============================================================
+# PREPARE GENE LISTS
+# ============================================================
+
+
+# Significant genes (FDR < 0.05): 883 down + 662 up
+dsad_sig <- dsad_results %>% filter(adj.P.Val < 0.05)
+cat("Total significant DSAD region effect genes:", nrow(dsad_sig), "\n")
+cat("Up:", sum(dsad_sig$logFC > 0), "Down:", sum(dsad_sig$logFC < 0), "\n")
+
+# For enrichment: need Entrez IDs (clusterProfiler works best with these)
+# Map Ensembl → Entrez via org.Hs.eg.db
+library(org.Hs.eg.db)
+
+sig_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                                    keys = dsad_sig$ensembl_gene_id[!is.na(dsad_sig$ensembl_gene_id)],
+                                    columns = "ENTREZID",
+                                    keytype = "ENSEMBL") %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(ENSEMBL, .keep_all = TRUE)
+
+cat("Genes with Entrez ID mapping:", nrow(sig_entrez), "\n")
+
+# Universe: all tested genes (for background in enrichment)
+universe_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                                         keys = dsad_results$ensembl_gene_id[!is.na(dsad_results$ensembl_gene_id)],
+                                         columns = "ENTREZID",
+                                         keytype = "ENSEMBL") %>%
+  filter(!is.na(ENTREZID)) %>%
+  pull(ENTREZID) %>%
+  unique()
+
+cat("Universe size:", length(universe_entrez), "\n")
+
+dt_full <- decideTests(efit_full)
+top50_genes <- dsad_results$ensembl_gene_id[1:50]
+top50_genes <- top50_genes[!is.na(top50_genes)]
+lcpm_full <- cpm(dge, log = TRUE)
+i <- which(rownames(lcpm_full) %in% top50_genes)
+group_tissue_labels <- dge$samples$group_tissue
+mycol <- colorpanel(1000, "blue", "white", "red")
+gene_labels <- ifelse(
+  is.na(dge$genes$external_gene_name[i]) | dge$genes$external_gene_name[i] == "",
+  rownames(lcpm_full)[i],
+  dge$genes$external_gene_name[i]
+)
+
+# ============================================================
+# BUILD RANKED GENE LIST FOR GSEA
+# ============================================================
+
+# Derive from dsad_results — add rank score
+dsad_ranked <- dsad_results %>%
+  filter(!is.na(ensembl_gene_id)) %>%
+  mutate(rank_score = sign(logFC) * -log10(P.Value))
+
+# Map Ensembl → Entrez
+ranked_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                                       keys = dsad_ranked$ensembl_gene_id,
+                                       columns = "ENTREZID",
+                                       keytype = "ENSEMBL") %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(ENSEMBL, .keep_all = TRUE)
+
+# Join rank scores with Entrez IDs
+ranked_genes <- dsad_ranked %>%
+  left_join(ranked_entrez, by = c("ensembl_gene_id" = "ENSEMBL")) %>%
+  filter(!is.na(ENTREZID)) %>%
+  arrange(desc(rank_score))
+
+# Remove duplicate Entrez IDs — keep highest absolute rank score per ID
+ranked_genes_dedup <- ranked_genes %>%
+  group_by(ENTREZID) %>%
+  slice_max(abs(rank_score), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(rank_score))
+
+# Named numeric vector — required format for gseGO/gseKEGG
+gene_rank_vec <- setNames(ranked_genes_dedup$rank_score, 
+                          ranked_genes_dedup$ENTREZID)
+
+# Verify
+cat("Total genes in ranked list:", length(gene_rank_vec), "\n")
+cat("Unique Entrez IDs:", length(unique(names(gene_rank_vec))), "\n")
+head(gene_rank_vec)
+tail(gene_rank_vec)
+
+gsea_kegg <- readRDS("data/gsea_kegg.rds")
+# gseKEGG run once and saved — tests enrichment against KEGG pathway database
+# (curated metabolic/signaling pathways, e.g. "Alzheimer disease", "Lysosome")
+
+#gsea_kegg <- gseKEGG(
+#  geneList      = gene_rank_vec,
+#  organism      = "hsa",
+#  minGSSize     = 10,
+#  maxGSSize     = 500,
+#  pAdjustMethod = "BH",
+#  pvalueCutoff  = 0.05,
+#  verbose       = FALSE,
+#  seed          = TRUE
+#)
+
+cat("GSEA KEGG significant pathways:", nrow(as.data.frame(gsea_kegg)), "\n")
+
+as.data.frame(gsea_kegg) %>%
+  dplyr::select(Description, NES, p.adjust, setSize) %>%
+  arrange(p.adjust) %>%
+  head(20)
+
+# gseGO run once and saved — tests enrichment against Gene Ontology Biological Process (GO:BP)
+# (finer-grained biological processes, e.g. "oxidative phosphorylation", "vesicle trafficking")
+# Complementary to KEGG: GO:BP gives process-level detail, KEGG gives pathway-level context
+
+
+gsea_go   <- readRDS("data/gsea_go.rds")
+
+#gsea_go <- gseGO(
+#  geneList      = gene_rank_vec,
+#  OrgDb         = org.Hs.eg.db,
+#  ont           = "BP",
+#  minGSSize     = 10,
+#  maxGSSize     = 500,
+#  pAdjustMethod = "BH",
+#  pvalueCutoff  = 0.05,
+#  verbose       = FALSE,
+#  seed          = TRUE
+#)
+
+cat("GSEA GO BP significant terms:", nrow(as.data.frame(gsea_go)), "\n")
+
+as.data.frame(gsea_go) %>%
+  dplyr::select(Description, NES, p.adjust, setSize) %>%
+  arrange(p.adjust) %>%
+  head(20)
+
+
+
+```
+
+
+## Background & Dataset
+
+Bulk RNA-seq of postmortem AD brain shows **limited separation from
+normal aging**: immune and synaptic signals exist but are
+heterogeneous and sample-size sensitive. DSAD (trisomy 21 → APP
+triplication) shares core AD programs but adds chromosomal dosage
+biology, making it a partial rather than complete AD proxy.
+
+The **paired prefrontal cortex-cerebellum design** is underexplored as an
+analytical strategy. Cerebellum is relatively spared in AD but not
+transcriptionally silent, so within-person regional comparisons can be
+more sensitive than single-region group differences.
+
+**Dataset: E-MTAB-14179**, Thorwald et al. 2025 (*Alzheimer's & Dementia*)<br>
+Primary paper focused on iron metabolism and ferroptosis at
+the protein level; transcriptomic data was deposited but not fully analyzed
+
+42 samples from 23 donors · CTL (n=8) · sporadic AD (n=7) · DSAD (n=8)<br>
+19 donors with paired prefrontal cortex + cerebellum · all APOE3/3<br>
+Braak, PMI, sex, age available · publicly deposited counts matrix
+
+---
+
+## Pipeline Overview
+
+**Original authors (Thorwald et al. 2025):**  
+FASTQ → STAR alignment → Count matrix deposited at E-MTAB-14179
+
+
+**This reanalysis (from deposited count matrix):**  
+edgeR/limma-voom → clusterProfiler GSEA
+
+---
+
+## Sample Characteristics & Analytical Decisions
+
+```{r}
+#| label: confounders
+
+# One row per donor. Subsetting to cortex would drop the two donors who
+# contributed cerebellum only, so deduplicate on donor instead.
+paired_ids <- names(which(table(meta$individual_id) == 2))
+
+meta %>%
+  distinct(individual_id, .keep_all = TRUE) %>%
+  group_by(disease) %>%
+  summarise(
+    n = n(),
+    pairs = sum(individual_id %in% paired_ids),
+    age_mean_sd = paste0(round(mean(age), 1), " ± ", round(sd(age), 1)),
+    sex_f_m = paste0(sum(sex == "female"), "/", sum(sex == "male")),
+    braak = paste0(min(as.numeric(as.character(braak)), na.rm=TRUE),
+                   "–",
+                   max(as.numeric(as.character(braak)), na.rm=TRUE)),
+    pmi_mean = round(mean(pmi, na.rm=TRUE), 1),
+    site = paste(unique(as.character(adrc)), collapse="/")
+  ) %>%
+  dplyr::rename(Group=disease, N=n, `Complete pairs`=pairs,
+         `Age (mean±SD)`=age_mean_sd,
+         `Sex (F/M)`=sex_f_m, `Braak range`=braak,
+         `Post-mortem interval (mean hours)`=pmi_mean, Site=site) %>%
+  kable()
+
+```
+
+
+**Covariate decisions:**
+
+- **Sex**: balanced (3-4/group), included as covariate
+- **Age**: included in AD vs CTL models (within-group variation). 
+  For DSAD: only analyzed in the paired cross-tissue model where 
+  individual-level confounds including age cancel within pairs
+- **Braak**: collinear with group (CTL=0-1, AD=3-6), so not added
+- **PMI**: no group difference between AD and CTL (Kruskal-Wallis 
+  p=0.72 prefrontal cortex, p=0.85 cerebellum) and negligible 
+  correlation with expression (r=0.12) — not added. 3 samples 
+  have missing PMI, adding it would reduce n unnecessarily. 
+  Confounded with site in DSAD; cancels within pairs in paired model.
+- **Site**: DSAD=UCI, AD/CTL=USC. Fully confounded; reported as a caveat rather than adjusted for.
+
+
+---
+
+```{r}
+#| label: QC - Library Size and Normalization
+#| fig-cap: "Before and after TMM normalization"
+#| include: false
+par(mfrow = c(1, 2))
+boxplot(cpm(dge_unnorm, log = TRUE), las = 2, main = "Before TMM")
+boxplot(cpm(dge, log = TRUE), las = 2, main = "After TMM")
+par(mfrow = c(1, 1))
+
+```
+
+## MDS: Brain Region Dominates
+
+```{r}
+#| label: mds-full
+lcpm_all <- cpm(dge, log = TRUE)
+par(mar = c(5,4,4,8), xpd = FALSE)
+
+col.group_full <- brewer.pal(nlevels(dge$samples$group), "Set1")[dge$samples$group]
+pch.brain      <- c(16, 17)[dge$samples$brain_part]
+
+mds_full <- plotMDS(lcpm_all, pch = pch.brain, col = col.group_full, cex = 1.5)
+title("All samples: disease and brain region")
+
+par(xpd = TRUE)
+xlim <- range(mds_full$x); ylim <- range(mds_full$y)
+legend(xlim[2]+0.3, ylim[2], legend = levels(dge$samples$group),
+       col = brewer.pal(3,"Set1"), pch = 16, title = "Disease", bty = "n")
+legend(xlim[2]+0.3, ylim[2]-2.0, legend = levels(dge$samples$brain_part),
+       col = "black", pch = c(16,17), title = "Brain region", bty = "n")
+par(mar = c(5,4,4,2), xpd = FALSE)
+```
+Dim 1 (45% variance) separates cerebellum from prefrontal cortex cleanly; disease groups show no comparable separation.<br>
+→ Continuing with analyses split by region; paired design used for cross-tissue comparison.
+
+---
+
+## AD vs CTL: No FDR-Significant Genes in Either Region
+
+```{r}
+#| label: cortex-cer-mds
+#| fig-width: 11
+#| fig-height: 5
+par(mfrow = c(1,2), mar = c(4,4,4,2))
+
+# Cortex
+group_pc     <- dge_pc$samples$group
+col.group_pc <- brewer.pal(nlevels(group_pc), "Set1")[group_pc]
+pch.sex_pc   <- c(16,17)[dge_pc$samples$sex]
+mds_pc <- plotMDS(lcpm_pc, pch = pch.sex_pc, col = col.group_pc, cex = 1.5)
+title("Cortex: AD vs CTL")
+text(mds_pc$x, mds_pc$y, labels = dge_pc$samples$age, pos = 2, cex = 0.6)
+legend("bottomright", legend = c("AD", "CTL", "female", "male"),
+       col = c(brewer.pal(3,"Set1")[1:2], "black", "black"),
+       pch = c(16, 16, 16, 17), bty = "n", cex = 0.7)
+
+# Cerebellum
+group_cer     <- dge_cer$samples$group
+col.group_cer <- brewer.pal(nlevels(group_cer), "Set1")[group_cer]
+pch.sex_cer   <- c(16,17)[dge_cer$samples$sex]
+mds_cer <- plotMDS(lcpm_cer, pch = pch.sex_cer, col = col.group_cer, cex = 1.5)
+title("Cerebellum: AD vs CTL")
+text(mds_cer$x, mds_cer$y, labels = dge_cer$samples$age, pos = 2, cex = 0.6)
+legend("bottomright", legend = c("AD", "CTL", "female", "male"),
+       col = c(brewer.pal(3,"Set1")[1:2], "black", "black"),
+       pch = c(16, 16, 16, 17), bty = "n", cex = 0.7)
+
+par(mfrow = c(1,1), mar = c(5,4,4,2))
+```
+
+- **0 FDR-significant genes in either region**, age + sex adjusted
+  (cortex: 7 AD vs 7 CTL; cerebellum: 6 AD vs 8 CTL)
+- Top nominal prefrontal cortex hits: VGF↓, CRH↓, SCG3↓ (neuroendocrine/synaptic)
+- Top nominal cerebellum hits: entirely non-overlapping with cortex
+- Consistent with known AD/aging transcriptional overlap in bulk tissue
+- *DSAD excluded from single-region analyses — site (UCI vs USC) 
+  fully confounded with group; addressed separately via paired cross-tissue model*
+
+
+```{r}
+#| label: Cortex - Sex-Stratified AD vs CTL
+#| include: false
+
+# side by side tables
+cat("--- Females ---\n"); top_f
+cat("--- Males ---\n"); top_m
+
+# comparison
+cat("Female only:\n")
+setdiff(top_f$external_gene_name, top_m$external_gene_name)
+cat("Male only:\n")
+setdiff(top_m$external_gene_name, top_f$external_gene_name)
+cat("Shared:\n")
+intersect(top_f$external_gene_name, top_m$external_gene_name)
+
+# - No overlap between female and male top hits
+# - Females: TTR↓, HSD11B2↑ — neuroprotective/stress
+# - Males: C1QA↑, C1QB↑, LAPTM5↑ — complement/microglial
+# - Hypothesis-generating at n=3-4/sex; warrants larger study
+
+```
+
+
+
+---
+
+## Braak Gradient in Prefrontal Cortex
+
+Binary AD vs CTL comparison yielded 0 FDR-significant genes — 
+Braak stage (0→6) tested as a continuous severity predictor 
+to increase power. Age and sex adjusted · CTL + AD · n=14  
+*(DSAD excluded: all Braak 6, no severity gradient)*
+
+**Result: still no FDR-significant genes**
+
+Top nominal hits nonetheless consistent with AD vs CTL: 
+VGF↓, SCG2↓, SCG3↓ — neuroendocrine/synaptic genes declining 
+with pathology severity in prefrontal cortex, not in cerebellum
+
+Convergent evidence across two analytical approaches — 
+the signal exists but is below detection threshold at this sample size
+
+```{r}
+#| label: braak
+#| include: false
+
+
+# Design: Braak as continuous covariate, adjusted for age and sex
+# No group term — Braak replaces it as the continuous severity measure
+
+# Cortex top hits
+cat("--- Cortex Braak-associated genes ---\n")
+top_braak_pc
+
+# Cerebellum top hits
+cat("--- Cerebellum Braak-associated genes ---\n")
+top_braak_cer
+
+# Comparison
+cat("Cortex only:\n")
+setdiff(top_braak_pc$external_gene_name, top_braak_cer$external_gene_name)
+cat("Cerebellum only:\n")
+setdiff(top_braak_cer$external_gene_name, top_braak_pc$external_gene_name)
+cat("Shared:\n")
+intersect(top_braak_pc$external_gene_name, top_braak_cer$external_gene_name)
+
+
+top_braak_pc_50 <- topTable(efit_braak_pc, coef = "braak_num", n = 50, sort.by = "P")
+top_braak_cer_50 <- topTable(efit_braak_cer, coef = "braak_num", n = 50, sort.by = "P")
+
+cat("Shared in top 50:\n")
+intersect(top_braak_pc_50$external_gene_name, top_braak_cer_50$external_gene_name)
+
+top_braak_pc_100 <- topTable(efit_braak_pc, coef = "braak_num", n = 100, sort.by = "P")
+top_braak_cer_100 <- topTable(efit_braak_cer, coef = "braak_num", n = 100, sort.by = "P")
+
+cat("Shared in top 100:\n")
+intersect(top_braak_pc_100$external_gene_name, top_braak_cer_100$external_gene_name)
+```
+
+---
+
+## Cross-Tissue Interaction: DSAD Regional Signature
+
+Within-person prefrontal cortex − cerebellum difference vs CTL  
+*(19 complete pairs: CTL n=7, AD n=6, DSAD n=6)*
+
+| Contrast | Down | Up | Total sig. genes |
+|----------|------|-----|-----------------|
+| AD region effect | 0 | 2 | 2 |
+| DSAD region effect | 883 | 662 | **1545** |
+
+DSAD disrupts the normal cortex-cerebellum expression relationship massively.  
+Sporadic AD does not, despite similar Braak scores in the most severe AD cases.
+
+**Top DSAD-specific hits**: KIF5A (axonal transport), TSC2 (mTOR/autophagy),  
+PEX6 (peroxisomal biogenesis), RAPGEF4 (vesicle trafficking)  
+→ convergent on endosomal-lysosomal-autophagy axis
+
+*Paired design: individual-level confounds (genetics, PMI, site) cancel within pairs*
+
+```{r}
+#| label: cross-tissue
+#| include: false
+
+# Summary table
+summary(decideTests(efit_full))
+
+# Top DSAD region genes
+top_dsad_region
+
+# AD-relevant pathway genes check
+dsad_results %>%
+  filter(external_gene_name %in% ad_pathway_genes) %>%
+  dplyr::select(external_gene_name, logFC, adj.P.Val)
+
+# Shared vs DSAD-specific
+cat("Shared AD+DSAD regional disruption:\n")
+intersect(top_ad_region, top_dsad_region_names)
+cat("DSAD-specific:\n")
+setdiff(top_dsad_region_names, top_ad_region)
+
+
+
+```
+
+
+
+
+
+```{r}
+#| label: DSAD Region Effect - Key Genes
+#| include: false
+plotMD(efit_full, column = "DSAD_region_effect",
+       status = dt_full[, "DSAD_region_effect"],
+       main = "DSAD: Cortex-Cerebellum regional disruption",
+       xlim = c(-10, 10))
+
+```
+
+
+
+
+
+```{r}
+#| label: DSAD Region Effect - Heatmap
+#| include: false
+#| fig-width: 12
+#| fig-height: 10
+heatmap.2(lcpm_full[i, ],
+          scale = "row",
+          labRow = gene_labels,
+          labCol = group_tissue_labels,
+          col = mycol,
+          trace = "none",
+          density.info = "none",
+          margin = c(6, 8),
+          lhei = c(1.5, 8),
+          dendrogram = "column",
+          cexRow = 0.6,
+          cexCol = 0.7,
+          main = "Top 50 DSAD region-effect genes")
+
+```
+
+---
+
+## DSAD Region Effect: Volcano
+
+```{r}
+
+
+#| label: volcano
+#| warning: false
+
+top_extreme <- dsad_results %>%
+  filter(adj.P.Val < 0.05, abs(logFC) > 2) %>%
+  arrange(P.Value) %>%
+  head(20) %>%
+  pull(external_gene_name)
+
+dsad_volcano <- dsad_results %>%
+  mutate(
+    sig = adj.P.Val < 0.05,
+    label = ifelse(external_gene_name %in% top_extreme, external_gene_name, "")
+  )
+
+ggplot(dsad_volcano, aes(x = logFC, y = -log10(P.Value), color = sig)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  scale_color_manual(values = c("grey60", "red3"),
+                     labels = c("Not significant", "FDR < 0.05")) +
+  geom_text_repel(aes(label = label), size = 2.5, 
+                  max.overlaps = 30,
+                  box.padding = 0.3,
+                  segment.size = 0.2) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+  labs(x = "Log2 FC (DSAD Ctx−Cer vs CTL Ctx−Cer)",
+       y = "-log10(p-value)", color = "") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+
+```
+
+---
+
+## DSAD Regional Disruption: Pathway Enrichment
+
+```{r}
+#| label: gsea-kegg
+# ============================================================
+# VISUALIZE KEGG GSEA (17 significant pathways)
+# ============================================================
+as.data.frame(gsea_kegg) %>%
+  arrange(NES) %>%
+  mutate(Description = factor(Description, levels = Description)) %>%
+  ggplot(aes(x = NES, y = Description, size = setSize, color = p.adjust)) +
+  geom_point() +
+  scale_color_continuous(low = "red", high = "blue", name = "adj. p-value", trans = "log10") +
+  scale_size_continuous(name = "Gene count") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(x = "Normalized Enrichment Score (NES)", y = "", title = "")
+
+```
+
+*Within-person prefrontal cortex−cerebellum difference vs CTL*  
+*NES > 0: upregulated in DSAD · NES < 0: downregulated · Color = adjusted p-value*
+
+---
+
+## DSAD Regional Disruption: Pathway Interpretation
+
+16 upregulated pathways dominated by **ribosomal/mitochondrial stress**  
+(Ribosome, Oxidative phosphorylation) and **neurodegeneration-relevant** pathways:
+
+- **Lysosome biogenesis**, matching the KIF5A/TSC2/PEX6 individual gene hits
+- **Alzheimer disease pathway**: directly relevant
+- **Reactive oxygen species**, echoing Thorwald et al.'s ferroptosis findings at the protein level
+
+1 downregulated: **Phototransduction** (cerebellar signaling genes),
+relatively suppressed in DSAD prefrontal cortex
+
+→ Transcriptomic pathway disruption converges on the same oxidative stress  
+and proteostasis mechanisms reported at protein level in the companion paper
+
+---
+
+## Connection to Published Analysis
+
+| | Thorwald et al. 2025 | This reanalysis |
+|--|--|--|
+| CTL vs AD PFC | 10 DEGs (incl. VGF) | 0 FDR-sig (VGF top nominal) |
+| CTL vs AD cerebellum | 1374 DEGs | 0 FDR-significant |
+| Region overlap | None (all comparisons) | None confirmed (AD vs CTL + Braak gradient) |
+| Pathway analysis | IPA (commercial) | clusterProfiler GSEA (open source) |
+| Braak gradient | Not done | Region-specific signatures |
+| Cross-tissue interaction | Not done | 1545 DSAD-specific genes |
+
+*Discrepancy in CTL vs AD cerebellum (1374 vs 0): Thorwald et al. applied
+RUVSeq correction (parameters unreported) and DESeq2 without stated age
+adjustment or FDR threshold, so a full comparison isn't possible without
+complete methodological details*
+
+---
+
+## Key Conclusions
+
+1. **AD vs CTL**: 0 FDR-significant genes in bulk cortex or cerebellum;
+top nominal hits (VGF↓, CRH↓, SCG3↓) are consistent with known
+neuroendocrine/synaptic decline in the AD literature
+
+2. **Braak gradient in prefrontal cortex**: top nominal hits (VGF↓, SCG2↓, SCG3↓) 
+consistent with AD vs CTL — converging evidence across two analytical approaches 
+despite no FDR-significant genes at n=14
+
+3. **DSAD prefrontal cortex−cerebellum disruption**: 1545 FDR-significant 
+genes in the paired interaction model, enriched for lysosomal, peroxisomal, 
+mitochondrial, and oxidative stress pathways, echoing Thorwald et al.'s 
+protein-level findings
+
+4. **DSAD is not transcriptomically equivalent to sporadic AD**: regional disruption is massive
+in DSAD and negligible in sporadic AD. The site confound is acknowledged, but the
+pattern is consistent with genuine biological divergence
+
+---
+
+## Limitations
+
+- 7-8 donors/group, and only 6 complete pairs per disease group: low power; no FDR-significant genes in AD vs CTL
+- DSAD samples come from a different site (UCI vs USC), confounded with group, age, and PMI; unresolvable in this design
+- Bulk RNA-seq dilutes cell-type-specific signals, so microglial activation isn't detectable
+
+

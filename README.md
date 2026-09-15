@@ -16,9 +16,10 @@ within each person, rather than treating the two regions as independent
 samples.
 
 The full literate source, including all code, is in
-[`Transcriptomics_AD.qmd`](Transcriptomics_AD.qmd). The rendered version is
-[`Transcriptomics_AD.html`](Transcriptomics_AD.html) — self-contained, so
-downloading and opening it in a browser is enough.
+[`Transcriptomics_AD.qmd`](Transcriptomics_AD.qmd). The rendered presentation
+is available at **[this link](https://rahel31.github.io/transcriptomics_AD/Transcriptomics_AD.html)**,
+or can be downloaded as [`Transcriptomics_AD.html`](Transcriptomics_AD.html)
+and opened locally in a browser.
 
 ## Data
 
